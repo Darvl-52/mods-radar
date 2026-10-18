@@ -1,0 +1,13 @@
+{
+  "name": "mods-radar",
+  "description": "Which plugin hooks modules are loaded and working right now, and where they get in each other's way",
+  "owner": {
+    "name": "Darvl-52"
+  },
+  "plugins": [
+    {
+      "name": "mods-radar",
+      "source": "./"
+    }
+  ]
+}

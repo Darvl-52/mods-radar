@@ -1,0 +1,11 @@
+{
+  "name": "mods-radar",
+  "version": "0.1.0",
+  "description": "Which plugin hooks modules are loaded and working right now, and where they get in each other's way; /mods for the details",
+  "author": {
+    "name": "Darvl-52"
+  },
+  "repository": "https://github.com/Darvl-52/mods-radar",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
