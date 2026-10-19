@@ -1,6 +1,6 @@
 {
   "name": "mods-radar",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Which plugin hooks modules are loaded and working right now, and where they get in each other's way; /mods for the details",
   "author": {
     "name": "Darvl-52"
