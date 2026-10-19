@@ -24,9 +24,10 @@ export const matches = (pattern: string, event: string): boolean =>
     ? !matches(pattern.slice(1), event)
     : pattern === '*' || pattern === event || (pattern.endsWith('.*') && event.startsWith(pattern.slice(0, -1)))
 
-// A chain entry names a module by its plugin's name, or by a path inside the plugin's folder.
+// A chain entry names a module by its plugin's name, or by a path inside the plugin's folder
+// (`\` between the parts on Windows).
 export const nameOf = (entry: string): string => {
-  const parts = entry.split('/').filter(Boolean)
+  const parts = entry.split(/[\\/]/).filter(Boolean)
   if (parts.length < 2) return entry.replace(/@.*$/, '')
   const at = parts.lastIndexOf('hooks')
   const folder = at > 0 ? parts.slice(0, at) : parts.slice(0, -1)
@@ -34,6 +35,28 @@ export const nameOf = (entry: string): string => {
   const cache = folder.lastIndexOf('cache')
   return (cache >= 0 && folder.length >= cache + 3 ? folder[cache + 2] : folder[folder.length - 1]) ?? entry
 }
+
+// A path under a directory, joined with the separator that directory already uses.
+export const under = (dir: string, ...names: string[]): string =>
+  [dir.replace(/[\\/]+$/, ''), ...names].join(dir.includes('\\') ? '\\' : '/')
+
+// One directory however it is spelled; a drive letter or a `\` means Windows, where case does not count.
+export const samePath = (a: string, b: string): boolean => {
+  const plain = (p: string) => p.replace(/[\\/]+/g, '/').replace(/(.)\/$/, '$1')
+  const isWindows = [a, b].some(p => /^[A-Za-z]:/.test(p) || p.includes('\\'))
+  return isWindows ? plain(a).toLowerCase() === plain(b).toLowerCase() : plain(a) === plain(b)
+}
+
+// The config folder an installed plugin sits in: <config>/plugins/cache/<market>/<name>/<version>.
+export const configOf = (root: string): string | undefined => root.match(/^(.+)[\\/]plugins[\\/]cache[\\/][^\\/]+[\\/][^\\/]+/)?.[1]
+
+export type Install = { scope?: string; projectPath?: string; installPath?: string; version?: string }
+
+// A plugin installed in several scopes has an entry each: this project's own, else one for every project.
+export const installOf = (entries: readonly Install[] | undefined, project: string | undefined): Install | undefined =>
+  entries?.find(i => i.projectPath !== undefined && project !== undefined && samePath(i.projectPath, project)) ??
+  entries?.find(i => i.projectPath === undefined) ??
+  entries?.[0]
 
 export type Link = Pick<TraceEntry, 'index' | 'plugin' | 'outcome' | 'reason'> & { received: unknown }
 export type Finding = { kind: Conflict['kind']; by: string; victim: string; event: string }
@@ -126,10 +149,18 @@ let pendingRuns: Record<string, { runs: number; failures: number; lastAt: number
 let pendingFound: (Finding & { at: number })[] = []
 let pendingLoads: Record<string, Partial<Mod>> = {}
 let isFlushing = false
+// A /clear emptied $.state: the next flush looks at the settings again first.
+let isStale = false
+// The folders of the plugins seen loading, for finding the config folder they were installed in.
+const roots: string[] = []
 // What each plugin's hooks were seen running on (`tool.call Edit`), for telling who an answer cut off.
 const ranOn: Record<string, Set<string>> = {}
 
 const flush = async ($: EngineInterface) => {
+  if (isStale) {
+    isStale = false
+    await discover($).catch(() => {})
+  }
   const runs = pendingRuns
   const found = pendingFound
   const loads = pendingLoads
@@ -189,6 +220,21 @@ const noteRun = (plugin: string, event: string, at: number, failure?: string) =>
   }
 }
 
+// The installed plugins' list, in the config folder: CLAUDE_CONFIG_DIR, else the one the loaded
+// plugins were installed in, else ~/.claude by HOME or by USERPROFILE (Windows sets no HOME).
+const readInstalled = async ($: EngineInterface): Promise<Record<string, Install[]>> => {
+  const homes = [await $.env.get('HOME'), await $.env.get('USERPROFILE')].flatMap(h => (h ? [under(h, '.claude')] : []))
+  const found = [await $.env.get('CLAUDE_CONFIG_DIR'), ...[...roots, $.plugin.root].map(configOf), ...homes]
+  for (const dir of new Set(found.filter((d): d is string => d !== undefined && d !== ''))) {
+    const list = await $.fs
+      .read(under(dir, 'plugins', 'installed_plugins.json'))
+      .then(text => (JSON.parse(text) as { plugins?: Record<string, Install[]> }).plugins ?? {})
+      .catch(() => undefined)
+    if (list !== undefined) return list
+  }
+  return {}
+}
+
 // What should be loaded: plugins enabled in settings whose hooks.json names a module.
 const discover = async ($: EngineInterface) => {
   if (chain.length > 0) await update($, order, () => chain)
@@ -197,11 +243,8 @@ const discover = async ($: EngineInterface) => {
   const enabled = Object.entries(settings.enabledPlugins ?? {})
     .filter(([, isOn]) => isOn === true)
     .map(([id]) => id)
-  const home = await $.env.get('HOME')
-  const installed = await $.fs
-    .read(`${home}/.claude/plugins/installed_plugins.json`)
-    .then(text => (JSON.parse(text) as { plugins?: Record<string, { installPath?: string; version?: string }[]> }).plugins ?? {})
-    .catch(() => ({}) as Record<string, { installPath?: string; version?: string }[]>)
+  const installed = await readInstalled($)
+  const project = await $.session.root().catch(() => undefined)
   const plain: string[] = []
   await update($, mods, old => {
     const all = shaped(old)
@@ -210,8 +253,8 @@ const discover = async ($: EngineInterface) => {
   })
   for (const id of enabled) {
     const name = id.replace(/@.*$/, '')
-    const entry = installed[id]?.[0]
-    const hooksFile = await $.fs.read(`${entry?.installPath ?? '/nonexistent'}/hooks/hooks.json`).catch(() => '')
+    const entry = installOf(installed[id], project)
+    const hooksFile = entry?.installPath === undefined ? '' : await $.fs.read(under(entry.installPath, 'hooks', 'hooks.json')).catch(() => '')
     if (!/"modules"\s*:/.test(hooksFile) && !known.has(name)) {
       plain.push(name)
       continue
@@ -243,6 +286,7 @@ export const register: Register = on => {
       refused: result.refuse,
     }
     if (!chain.includes(e.name)) chain = [...chain, e.name]
+    if (!roots.includes(e.root)) roots.push(e.root)
     return result
   })
 
@@ -253,17 +297,15 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // A /clear empties $.state and starts no session.start: look again.
-  on('classic.SessionStart', async ($, e, next) => {
-    const ran = await next(e)
-    if (e.source !== 'startup') {
-      await discover($).catch(() => {})
-      await flush($)
-    }
-    return ran
-  }).catch(($, e, next) => next(e))
+  // A /clear empties $.state and starts no session.start: look again at the next flush, which
+  // the activity hook below asks for, and at every /mods, so that settings changed since are seen too.
+  on('session.end', ($, e, next) => {
+    if (e.reason === 'clear') isStale = true
+    return next(e)
+  })
 
   on('command.run', { command: 'mods' }, async $ => {
+    isStale = true
     await flush($)
     await update($, conflicts, old => (Array.isArray(old) ? old.map(c => ({ ...c, isNew: false })) : []))
     await $.ui.open({ id: PANE, title: 'Моды' })
